@@ -1,0 +1,11 @@
+{
+  "projectId": "pair-wise-yy-11",
+  "projectName": "StateBoard 状态机可视化编辑器",
+  "category": "状态机",
+  "businessDomain": "研发工具",
+  "projectForm": "完整项目",
+  "codeScope": "frontend",
+  "languages": "React, TypeScript, React Flow, XState, MUI, Zustand, Vite",
+  "summary": "可视化编辑状态与转移，支持条件动作配置、结构校验、事件模拟运行与 XState/Mermaid 导出。",
+  "containerized": false
+}
