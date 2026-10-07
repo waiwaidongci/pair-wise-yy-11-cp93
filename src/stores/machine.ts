@@ -21,6 +21,7 @@ import type {
 import {
   createState,
   evaluateCondition,
+  formatDuration,
   resolveValue,
   sampleMachine,
   sendEventId,
@@ -39,6 +40,10 @@ interface MachineState {
   trace: TraceEntry[]
   issues: ValidationIssue[]
   notice: string
+  /** 虚拟时钟（毫秒），模拟推进时间用 */
+  simClock: number
+  /** 进入当前状态时的虚拟时钟时间，用于计算超时转移的截止时刻 */
+  stateEnteredAt: number
   setName: (name: string) => void
   onNodesChange: (changes: NodeChange<StateNode>[]) => void
   onEdgesChange: (changes: EdgeChange<TransitionEdge>[]) => void
@@ -56,6 +61,8 @@ interface MachineState {
   setContextValue: (name: string, value: ContextValue) => void
   validate: () => ValidationIssue[]
   sendEvent: (event: string, synthetic?: boolean) => void
+  /** 推进虚拟时钟，到点的超时转移按截止时刻先后自动触发 */
+  advanceClock: (ms: number) => void
   resetSimulation: () => void
   loadDocument: (document: MachineDocument) => void
   reset: () => void
@@ -65,6 +72,24 @@ const initial = sampleMachine()
 
 function currentContext(variables: ContextVariable[]) {
   return Object.fromEntries(variables.map((variable) => [variable.name, variable.initial]))
+}
+
+/**
+ * 结构或转移变更后，作废旧计时并重算。
+ * 计时由「当前状态出站转移的 timeout」与「进入状态时间」派生，边一改就会自动重算；
+ * 唯一需要兜底的是当前状态被删除——此时回到初始状态，避免悬挂在不存在的状态上。
+ */
+function rearmAfterEdit(state: MachineState) {
+  if (state.currentStateId && !state.nodes.some((node) => node.id === state.currentStateId)) {
+    const initialNode = state.nodes.find((node) => node.data.initial && !node.parentId)
+      ?? state.nodes.find((node) => !node.parentId && node.data.kind !== 'compound')
+    state.currentStateId = initialNode?.id ?? null
+    state.context = currentContext(state.variables)
+    state.trace = []
+    state.simClock = 0
+    state.stateEnteredAt = 0
+    state.notice = '当前状态已删除，模拟已回到初始状态'
+  }
 }
 
 export const useMachineStore = create<MachineState>()(immer((set, get) => ({
@@ -79,15 +104,19 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
   trace: [],
   issues: [],
   notice: '已加载审批流程示例',
+  simClock: 0,
+  stateEnteredAt: 0,
 
   setName: (name) => set((state: MachineState) => { state.name = name }),
 
   onNodesChange: (changes) => set((state: MachineState) => {
     state.nodes = applyNodeChanges(changes, state.nodes)
+    rearmAfterEdit(state)
   }),
 
   onEdgesChange: (changes) => set((state: MachineState) => {
     state.edges = applyEdgeChanges(changes, state.edges)
+    rearmAfterEdit(state)
   }),
 
   connect: (connection) => set((state: MachineState) => {
@@ -96,12 +125,13 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
       ...connection,
       id: `transition-${Date.now().toString(36)}`,
       type: 'transition',
-      data: { event: 'NEXT', condition: '', action: '', assignments: [] },
+      data: { event: 'NEXT', condition: '', action: '', assignments: [], timeout: 0 },
     }
     state.edges = addEdge(edge, state.edges) as TransitionEdge[]
     state.selectedEdgeId = edge.id
     state.selectedNodeId = null
-    state.notice = '已创建转移，请在属性面板配置事件'
+    state.notice = '已创建转移，请在属性面板配置事件与等待时限'
+    rearmAfterEdit(state)
   }),
 
   addState: (kind, parentId = null) => set((state: MachineState) => {
@@ -118,6 +148,7 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
     state.selectedNodeId = stateNode.id
     state.selectedEdgeId = null
     state.notice = `已添加${kind === 'compound' ? '复合状态' : kind === 'final' ? '结束状态' : '状态'}`
+    rearmAfterEdit(state)
   }),
 
   selectNode: (id) => set((state: MachineState) => {
@@ -133,6 +164,7 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
   updateNode: (id, patch) => set((state: MachineState) => {
     const node = state.nodes.find((item) => item.id === id)
     if (node) node.data = { ...node.data, ...patch }
+    rearmAfterEdit(state)
   }),
 
   updateEdge: (id, patch) => set((state: MachineState) => {
@@ -143,8 +175,10 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
         condition: patch.condition ?? edge.data?.condition ?? '',
         action: patch.action ?? edge.data?.action ?? '',
         assignments: patch.assignments ?? edge.data?.assignments ?? [],
+        timeout: patch.timeout !== undefined ? patch.timeout : edge.data?.timeout,
       }
     }
+    rearmAfterEdit(state)
   }),
 
   deleteSelection: () => set((state: MachineState) => {
@@ -160,6 +194,7 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
       state.edges = state.edges.filter((edge) => edge.id !== state.selectedEdgeId)
       state.selectedEdgeId = null
     }
+    rearmAfterEdit(state)
   }),
 
   setInitial: (id) => set((state: MachineState) => {
@@ -167,7 +202,11 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
     if (!node) return
     state.nodes.filter((item) => item.parentId === node.parentId).forEach((item) => { item.data.initial = false })
     node.data.initial = true
-    if (!node.parentId) state.currentStateId = node.id
+    if (!node.parentId) {
+      state.currentStateId = node.id
+      state.stateEnteredAt = state.simClock
+    }
+    rearmAfterEdit(state)
   }),
 
   addVariable: () => set((state: MachineState) => {
@@ -230,6 +269,8 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
           action: '忽略事件',
           contextAfter: JSON.parse(JSON.stringify(draft.context)) as Record<string, ContextValue>,
           timestamp,
+          simClock: state.simClock,
+          trigger: 'event',
           accepted: false,
           reason,
         })
@@ -246,6 +287,8 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
     set((draft: MachineState) => {
       draft.context = nextContext
       draft.currentStateId = edge.target
+      // 进入新状态，等待时限从当前虚拟时钟重新起算
+      draft.stateEnteredAt = draft.simClock
       draft.trace.push({
         id: sendEventId(),
         event,
@@ -255,11 +298,69 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
         action: String(edge.data?.action ?? ''),
         contextAfter: JSON.parse(JSON.stringify(nextContext)) as Record<string, ContextValue>,
         timestamp,
+        simClock: state.simClock,
+        trigger: 'event',
         accepted: true,
       })
       draft.notice = synthetic
         ? `模拟执行：${from?.data.label ?? current} → ${target?.data.label ?? edge.target}`
         : `事件 ${event} 已触发，进入${target?.data.label ?? edge.target}`
+    })
+  },
+
+  advanceClock: (ms) => {
+    if (ms <= 0) return
+    set((draft: MachineState) => {
+      if (!draft.currentStateId) {
+        draft.notice = '模拟尚未进入任何状态'
+        return
+      }
+      const targetClock = draft.simClock + ms
+      let current = draft.currentStateId
+      let enteredAt = draft.stateEnteredAt
+      let fired = 0
+      // 安全上限：自环超时转移会反复进入同一状态，防止无限推进
+      const guardLimit = 200
+      while (fired < guardLimit) {
+        // 收集当前状态所有到点的超时转移，按截止时刻先后排序
+        const due = draft.edges
+          .filter((edge) => edge.source === current && edge.data?.timeout && edge.data.timeout > 0)
+          .map((edge) => ({ edge, deadline: enteredAt + (edge.data?.timeout ?? 0) }))
+          .filter((item) => item.deadline <= targetClock)
+          .sort((a, b) => a.deadline - b.deadline || a.edge.id.localeCompare(b.edge.id))
+        if (!due.length) break
+        const { edge, deadline } = due[0]
+        const nextContext = { ...draft.context }
+        ;(edge.data?.assignments ?? []).forEach((assignment) => {
+          if (assignment.variable) nextContext[assignment.variable] = resolveValue(assignment.expression, nextContext)
+        })
+        const from = draft.nodes.find((node) => node.id === current)
+        const to = draft.nodes.find((node) => node.id === edge.target)
+        draft.context = nextContext
+        draft.currentStateId = edge.target
+        current = edge.target
+        enteredAt = deadline
+        draft.stateEnteredAt = deadline
+        draft.trace.push({
+          id: sendEventId(),
+          event: '超时',
+          from: from?.id ?? current,
+          to: edge.target,
+          condition: '',
+          action: String(edge.data?.action ?? ''),
+          contextAfter: JSON.parse(JSON.stringify(nextContext)) as Record<string, ContextValue>,
+          timestamp: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          simClock: deadline,
+          trigger: 'timeout',
+          accepted: true,
+          reason: `等待 ${formatDuration(edge.data?.timeout ?? 0)} 未收到 ${String(edge.data?.event ?? '')}，超时转移至${to?.data.label ?? edge.target}`,
+        })
+        fired += 1
+      }
+      draft.simClock = targetClock
+      draft.notice = fired
+        ? `时钟推进 ${formatDuration(ms)}，触发 ${fired} 次超时转移`
+        : `时钟推进 ${formatDuration(ms)}，暂无超时到期`
     })
   },
 
@@ -269,19 +370,33 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
     state.currentStateId = initialNode?.id ?? null
     state.context = currentContext(state.variables)
     state.trace = []
+    state.simClock = 0
+    state.stateEnteredAt = 0
     state.notice = '模拟已回到初始状态'
   }),
 
   loadDocument: (document) => set((state: MachineState) => {
     state.name = document.name
     state.nodes = document.nodes
-    state.edges = document.edges
+    // 旧数据没有 timeout 字段，归一化后照旧可用；timeout 缺省即不限制
+    state.edges = document.edges.map((edge) => ({
+      ...edge,
+      data: {
+        event: edge.data?.event ?? 'NEXT',
+        condition: edge.data?.condition ?? '',
+        action: edge.data?.action ?? '',
+        assignments: edge.data?.assignments ?? [],
+        timeout: edge.data?.timeout ?? 0,
+      },
+    }))
     state.variables = document.variables
     state.context = currentContext(document.variables)
     state.selectedNodeId = null
     state.selectedEdgeId = null
     state.currentStateId = document.nodes.find((node) => node.data.initial && !node.parentId)?.id ?? null
     state.trace = []
+    state.simClock = 0
+    state.stateEnteredAt = 0
     state.notice = '状态机 JSON 已导入'
   }),
 
@@ -297,6 +412,8 @@ export const useMachineStore = create<MachineState>()(immer((set, get) => ({
     state.selectedEdgeId = null
     state.trace = []
     state.issues = []
+    state.simClock = 0
+    state.stateEnteredAt = 0
     state.notice = '已恢复审批流程示例'
   }),
 })))

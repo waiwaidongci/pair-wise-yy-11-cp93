@@ -1,5 +1,6 @@
 import { BaseEdge, EdgeLabelRenderer, getSmoothStepPath, type EdgeProps } from '@xyflow/react'
 import type { TransitionEdge as TransitionEdgeType } from '../types/machine'
+import { formatDuration } from '../utils/machine'
 
 export default function TransitionEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, data, selected }: EdgeProps<TransitionEdgeType>) {
   const [edgePath, labelX, labelY] = getSmoothStepPath({
@@ -11,7 +12,8 @@ export default function TransitionEdge({ id, sourceX, sourceY, targetX, targetY,
     targetPosition,
     borderRadius: 18,
   })
-  const label = [data?.event, data?.condition].filter(Boolean).join(' · ')
+  const timeoutLabel = data?.timeout ? ` ⏱${formatDuration(data.timeout)}` : ''
+  const label = [data?.event, data?.condition].filter(Boolean).join(' · ') + timeoutLabel
   return (
     <>
       <BaseEdge id={id} path={edgePath} style={{ stroke: selected ? '#2563eb' : '#728299', strokeWidth: selected ? 2.5 : 1.8 }} />

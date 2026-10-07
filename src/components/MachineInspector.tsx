@@ -44,6 +44,19 @@ export default function MachineInspector() {
         <TextField label="事件名称" size="small" value={edge.data?.event ?? ''} onChange={(event) => store.updateEdge(edge.id, { event: event.target.value.toUpperCase() })} />
         <TextField label="守卫条件" size="small" placeholder="例：amount > 5000" value={edge.data?.condition ?? ''} onChange={(event) => store.updateEdge(edge.id, { condition: event.target.value })} />
         <TextField label="动作说明" size="small" value={edge.data?.action ?? ''} onChange={(event) => store.updateEdge(edge.id, { action: event.target.value })} />
+        <TextField
+          label="等待时限（秒）"
+          type="number"
+          size="small"
+          inputProps={{ min: 0, step: 1 }}
+          placeholder="0 表示不限制"
+          value={edge.data?.timeout ? edge.data.timeout / 1000 : ''}
+          onChange={(event) => {
+            const seconds = Number(event.target.value)
+            store.updateEdge(edge.id, { timeout: seconds > 0 ? Math.round(seconds * 1000) : 0 })
+          }}
+          helperText="进入源状态后开始计时，时限内收到匹配事件则取消，到点自动走该转移"
+        />
         <Stack direction="row" alignItems="center" justifyContent="space-between">
           <Typography variant="subtitle2">上下文赋值</Typography>
           <Button size="small" onClick={() => store.updateEdge(edge.id, { assignments: [...assignments, { variable: store.variables[0]?.name ?? '', expression: '0' }] })}>添加</Button>

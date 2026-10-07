@@ -23,6 +23,8 @@ export interface TransitionData extends Record<string, unknown> {
   condition: string
   action: string
   assignments: Assignment[]
+  /** 等待时限（毫秒）。进入源状态后开始计时，时限内收到匹配事件则取消计时，到点仍未处理则自动走该转移。0 或 undefined 表示不限制。 */
+  timeout?: number
 }
 
 export type TransitionEdge = Edge<TransitionData, 'transition'>
@@ -42,6 +44,10 @@ export interface TraceEntry {
   action: string
   contextAfter: Record<string, ContextValue>
   timestamp: string
+  /** 虚拟时钟时间（毫秒），用于在轨迹中区分同时刻的事件与超时顺序 */
+  simClock: number
+  /** 触发方式：事件触发 或 超时触发 */
+  trigger: 'event' | 'timeout'
   accepted: boolean
   reason?: string
 }

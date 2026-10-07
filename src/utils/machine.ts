@@ -5,6 +5,19 @@ export function sendEventId() {
   return `event-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 }
 
+/** 把毫秒格式化为易读时长，如 30s、1m 30s、2h。用于虚拟时钟与等待时限展示。 */
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s'
+  const totalSeconds = ms / 1000
+  if (totalSeconds < 60) return `${Number(totalSeconds.toFixed(1))}s`
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  const seconds = Number((totalSeconds % 60).toFixed(1))
+  if (totalMinutes < 60) return seconds ? `${totalMinutes}m ${seconds}s` : `${totalMinutes}m`
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+  return minutes ? `${hours}h ${minutes}m` : `${hours}h`
+}
+
 export function stateId(prefix = 'state') {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
 }
@@ -56,7 +69,7 @@ export function sampleMachine(): { nodes: StateNode[]; edges: TransitionEdge[]; 
     { id: 't2', source: 'validating', target: 'manual', type: 'transition', data: { event: 'VALID', condition: 'amount > 5000', action: '分配人工审核', assignments: [] } },
     { id: 't3', source: 'validating', target: 'approved', type: 'transition', data: { event: 'VALID', condition: 'amount <= 5000', action: '自动审批通过', assignments: [] } },
     { id: 't4', source: 'validating', target: 'rejected', type: 'transition', data: { event: 'INVALID', condition: '', action: '记录驳回原因', assignments: [{ variable: 'rejectCount', expression: 'rejectCount + 1' }] } },
-    { id: 't5', source: 'manual', target: 'approved', type: 'transition', data: { event: 'APPROVE', condition: '', action: '审核通过', assignments: [] } },
+    { id: 't5', source: 'manual', target: 'approved', type: 'transition', data: { event: 'APPROVE', condition: '', action: '审核通过', assignments: [], timeout: 30000 } },
     { id: 't6', source: 'manual', target: 'rejected', type: 'transition', data: { event: 'REJECT', condition: '', action: '审核驳回', assignments: [] } },
     { id: 't7', source: 'rejected', target: 'draft', type: 'transition', data: { event: 'REVISE', condition: '', action: '进入补充资料', assignments: [] } },
   ]
@@ -175,6 +188,8 @@ interface ExportStateConfig {
   initial?: string
   states: Record<string, ExportStateConfig>
   on?: Record<string, { target: string } | Array<{ target: string }>>
+  /** XState 延迟转移：等待时限到点后自动触发，保留超时含义 */
+  after?: Record<string, { target: string }>
 }
 
 export function xstateConfig(nodes: StateNode[], edges: TransitionEdge[], variables: MachineDocument['variables']) {
@@ -184,24 +199,31 @@ export function xstateConfig(nodes: StateNode[], edges: TransitionEdge[], variab
   nodes.filter((node) => !node.parentId).forEach((node) => {
     const outgoing = edges.filter((edge) => edge.source === node.id)
     const transitions: Record<string, Array<{ target: string }>> = {}
+    const after: Record<string, { target: string }> = {}
     outgoing.forEach((edge) => {
       const event = String(edge.data?.event ?? 'EVENT')
       transitions[event] = [...(transitions[event] ?? []), { target: edge.target }]
+      const timeout = edge.data?.timeout
+      if (timeout && timeout > 0) after[String(timeout)] = { target: edge.target }
     })
     const children = nodes.filter((child) => child.parentId === node.id)
     const childStates: Record<string, ExportStateConfig> = {}
     children.forEach((child) => {
       const childTransitions: Record<string, Array<{ target: string }>> = {}
+      const childAfter: Record<string, { target: string }> = {}
       edges.filter((edge) => edge.source === child.id).forEach((edge) => {
         const event = String(edge.data?.event ?? 'EVENT')
         childTransitions[event] = [...(childTransitions[event] ?? []), { target: edge.target }]
+        const timeout = edge.data?.timeout
+        if (timeout && timeout > 0) childAfter[String(timeout)] = { target: edge.target }
       })
-      childStates[child.id] = { states: {}, on: childTransitions }
+      childStates[child.id] = { states: {}, on: childTransitions, after: childAfter }
     })
     states[node.id] = {
       initial: children.find((child) => child.data.initial)?.id,
       states: childStates,
       on: transitions,
+      after,
     }
   })
   const context = Object.fromEntries(variables.map((variable) => [variable.name, variable.initial]))
@@ -227,7 +249,8 @@ export function mermaidDiagram(nodes: StateNode[], edges: TransitionEdge[]) {
     if (node.data.kind === 'final') lines.push(`  state "${node.data.label}" as ${safeId(node.id)}`)
   })
   edges.forEach((edge) => {
-    const label = [edge.data?.event, edge.data?.condition ? `[${edge.data.condition}]` : '', edge.data?.action].filter(Boolean).join(' / ')
+    const timeoutLabel = edge.data?.timeout ? ` ⏱${formatDuration(edge.data.timeout)}` : ''
+    const label = [edge.data?.event, edge.data?.condition ? `[${edge.data.condition}]` : '', edge.data?.action].filter(Boolean).join(' / ') + timeoutLabel
     lines.push(`  ${safeId(edge.source)} --> ${safeId(edge.target)}: ${label || 'event'}`)
   })
   nodes.filter((node) => node.data.kind === 'final').forEach((node) => lines.push(`  ${safeId(node.id)} --> [*]`))
