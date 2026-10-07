@@ -37,6 +37,8 @@ export default function MachineInspector() {
 
   if (!edge) return null
   const assignments = edge.data?.assignments ?? []
+  const timeoutMs = edge.data?.timeoutMs
+  const hasTimeout = typeof timeoutMs === 'number' && timeoutMs > 0
   return (
     <aside className="side-panel inspector">
       <Typography variant="subtitle2">转移属性</Typography>
@@ -44,6 +46,32 @@ export default function MachineInspector() {
         <TextField label="事件名称" size="small" value={edge.data?.event ?? ''} onChange={(event) => store.updateEdge(edge.id, { event: event.target.value.toUpperCase() })} />
         <TextField label="守卫条件" size="small" placeholder="例：amount > 5000" value={edge.data?.condition ?? ''} onChange={(event) => store.updateEdge(edge.id, { condition: event.target.value })} />
         <TextField label="动作说明" size="small" value={edge.data?.action ?? ''} onChange={(event) => store.updateEdge(edge.id, { action: event.target.value })} />
+        <FormControlLabel
+          control={
+            <Checkbox
+              size="small"
+              checked={hasTimeout}
+              onChange={(event) => store.updateEdge(edge.id, { timeoutMs: event.target.checked ? (hasTimeout ? timeoutMs : 5000) : undefined })}
+            />
+          }
+          label="启用等待时限（超时转移）"
+        />
+        {hasTimeout && (
+          <TextField
+            type="number"
+            label="等待时限（毫秒）"
+            size="small"
+            value={timeoutMs}
+            inputProps={{ min: 1, step: 1000 }}
+            onChange={(event) => {
+              const value = Number(event.target.value)
+              store.updateEdge(edge.id, { timeoutMs: Number.isFinite(value) && value > 0 ? Math.round(value) : undefined })
+            }}
+          />
+        )}
+        <Typography variant="caption" color="text.secondary">
+          进入源状态即计时：时限内匹配事件到达则取消计时照常转移；一直无人处理才在到点后沿该转移超时执行。
+        </Typography>
         <Stack direction="row" alignItems="center" justifyContent="space-between">
           <Typography variant="subtitle2">上下文赋值</Typography>
           <Button size="small" onClick={() => store.updateEdge(edge.id, { assignments: [...assignments, { variable: store.variables[0]?.name ?? '', expression: '0' }] })}>添加</Button>

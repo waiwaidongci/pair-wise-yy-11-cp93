@@ -1,5 +1,5 @@
 import { createMachine } from 'xstate'
-import type { ContextValue, MachineDocument, StateNode, TransitionEdge, ValidationIssue } from '../types/machine'
+import type { ContextValue, MachineDocument, StateNode, TransitionData, TransitionEdge, ValidationIssue } from '../types/machine'
 
 export function sendEventId() {
   return `event-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
@@ -57,7 +57,7 @@ export function sampleMachine(): { nodes: StateNode[]; edges: TransitionEdge[]; 
     { id: 't3', source: 'validating', target: 'approved', type: 'transition', data: { event: 'VALID', condition: 'amount <= 5000', action: '自动审批通过', assignments: [] } },
     { id: 't4', source: 'validating', target: 'rejected', type: 'transition', data: { event: 'INVALID', condition: '', action: '记录驳回原因', assignments: [{ variable: 'rejectCount', expression: 'rejectCount + 1' }] } },
     { id: 't5', source: 'manual', target: 'approved', type: 'transition', data: { event: 'APPROVE', condition: '', action: '审核通过', assignments: [] } },
-    { id: 't6', source: 'manual', target: 'rejected', type: 'transition', data: { event: 'REJECT', condition: '', action: '审核驳回', assignments: [] } },
+    { id: 't6', source: 'manual', target: 'rejected', type: 'transition', data: { event: 'REJECT', condition: '', action: '审核驳回（30 秒未处理自动执行）', assignments: [], timeoutMs: 30000 } },
     { id: 't7', source: 'rejected', target: 'draft', type: 'transition', data: { event: 'REVISE', condition: '', action: '进入补充资料', assignments: [] } },
   ]
   return {
@@ -110,6 +110,30 @@ export function evaluateCondition(condition: string, context: Record<string, Con
     if (!match) return Boolean(resolveValue(part, context))
     return compare(resolveValue(match[1], context), match[2], resolveValue(match[3], context))
   }))
+}
+
+/** 虚拟时钟/时长格式化：800 → 800ms，5000 → 5s，90000 → 1m30s */
+export function formatClock(ms: number) {
+  if (ms < 1000) return `${ms}ms`
+  const seconds = ms / 1000
+  if (seconds < 60) return `${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = Math.round(seconds % 60)
+  return rest ? `${minutes}m${rest}s` : `${minutes}m`
+}
+
+/** 旧版本文档的转移没有 timeoutMs 等字段，导入时补齐缺省值，保证升级后照旧可用 */
+export function normalizeTransitionData(data: TransitionEdge['data'] | undefined): TransitionData {
+  const timeout = typeof data?.timeoutMs === 'number' && Number.isFinite(data.timeoutMs) && data.timeoutMs > 0
+    ? Math.round(data.timeoutMs)
+    : undefined
+  return {
+    event: String(data?.event ?? 'NEXT'),
+    condition: String(data?.condition ?? ''),
+    action: String(data?.action ?? ''),
+    assignments: Array.isArray(data?.assignments) ? data.assignments : [],
+    timeoutMs: timeout,
+  }
 }
 
 export function validateMachine(nodes: StateNode[], edges: TransitionEdge[]): ValidationIssue[] {
@@ -175,33 +199,43 @@ interface ExportStateConfig {
   initial?: string
   states: Record<string, ExportStateConfig>
   on?: Record<string, { target: string } | Array<{ target: string }>>
+  after?: Record<string, { target: string } | Array<{ target: string }>>
 }
 
 export function xstateConfig(nodes: StateNode[], edges: TransitionEdge[], variables: MachineDocument['variables']) {
   const rootInitial = nodes.find((node) => !node.parentId && node.data.initial)?.id
     ?? nodes.find((node) => !node.parentId && node.data.kind !== 'compound')?.id
+  const buildTransitions = (stateId: string) => {
+    const on: Record<string, Array<{ target: string }>> = {}
+    const after: Record<string, Array<{ target: string }>> = {}
+    edges.filter((edge) => edge.source === stateId).forEach((edge) => {
+      const event = String(edge.data?.event ?? 'EVENT')
+      on[event] = [...(on[event] ?? []), { target: edge.target }]
+      const timeoutMs = edge.data?.timeoutMs
+      if (typeof timeoutMs === 'number' && timeoutMs > 0) {
+        after[String(timeoutMs)] = [...(after[String(timeoutMs)] ?? []), { target: edge.target }]
+      }
+    })
+    return { on, after }
+  }
   const states: Record<string, ExportStateConfig> = {}
   nodes.filter((node) => !node.parentId).forEach((node) => {
-    const outgoing = edges.filter((edge) => edge.source === node.id)
-    const transitions: Record<string, Array<{ target: string }>> = {}
-    outgoing.forEach((edge) => {
-      const event = String(edge.data?.event ?? 'EVENT')
-      transitions[event] = [...(transitions[event] ?? []), { target: edge.target }]
-    })
+    const { on, after } = buildTransitions(node.id)
     const children = nodes.filter((child) => child.parentId === node.id)
     const childStates: Record<string, ExportStateConfig> = {}
     children.forEach((child) => {
-      const childTransitions: Record<string, Array<{ target: string }>> = {}
-      edges.filter((edge) => edge.source === child.id).forEach((edge) => {
-        const event = String(edge.data?.event ?? 'EVENT')
-        childTransitions[event] = [...(childTransitions[event] ?? []), { target: edge.target }]
-      })
-      childStates[child.id] = { states: {}, on: childTransitions }
+      const childTransitions = buildTransitions(child.id)
+      childStates[child.id] = {
+        states: {},
+        on: childTransitions.on,
+        ...(Object.keys(childTransitions.after).length ? { after: childTransitions.after } : {}),
+      }
     })
     states[node.id] = {
       initial: children.find((child) => child.data.initial)?.id,
       states: childStates,
-      on: transitions,
+      on,
+      ...(Object.keys(after).length ? { after } : {}),
     }
   })
   const context = Object.fromEntries(variables.map((variable) => [variable.name, variable.initial]))
@@ -227,7 +261,13 @@ export function mermaidDiagram(nodes: StateNode[], edges: TransitionEdge[]) {
     if (node.data.kind === 'final') lines.push(`  state "${node.data.label}" as ${safeId(node.id)}`)
   })
   edges.forEach((edge) => {
-    const label = [edge.data?.event, edge.data?.condition ? `[${edge.data.condition}]` : '', edge.data?.action].filter(Boolean).join(' / ')
+    const timeout = edge.data?.timeoutMs
+    const label = [
+      edge.data?.event,
+      edge.data?.condition ? `[${edge.data.condition}]` : '',
+      edge.data?.action,
+      typeof timeout === 'number' && timeout > 0 ? `after ${timeout}ms` : '',
+    ].filter(Boolean).join(' / ')
     lines.push(`  ${safeId(edge.source)} --> ${safeId(edge.target)}: ${label || 'event'}`)
   })
   nodes.filter((node) => node.data.kind === 'final').forEach((node) => lines.push(`  ${safeId(node.id)} --> [*]`))
